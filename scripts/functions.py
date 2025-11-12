@@ -55,6 +55,8 @@ class Env:
             "interventional": self.interventional,
             "dag": self.dag,
             "input_dim": self.input_dim,
+            "objective_nodes": self.dag.get_objective_nodes(),
+            "objective_dim": len(self.dag.get_objective_nodes()),
         }
 
     def get_env_profile(self):
