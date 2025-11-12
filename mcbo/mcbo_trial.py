@@ -14,7 +14,7 @@ from botorch.acquisition import PosteriorMean as GPPosteriorMean
 from botorch.sampling import SobolQMCNormalSampler
 
 from torch import Tensor
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from mcbo.acquisition_function_optimization.optimize_acqf import (
     optimize_acqf_and_get_suggested_point,
@@ -25,6 +25,7 @@ from mcbo.utils.fit_gp_model import fit_gp_model
 from mcbo.models.gp_network import GaussianProcessNetwork
 from mcbo.utils.posterior_mean import PosteriorMean
 from mcbo.models import eta_network
+from mcbo.utils.offline_data import OfflineDataset, load_offline_dataset
 import wandb
 
 def obj_mean(
@@ -54,12 +55,33 @@ def mcbo_trial(
     script_dir = os.path.dirname(os.path.realpath(sys.argv[0]))
     # results_folder = script_dir + "/results/" + problem + "/" + algo + "/"
 
-    # Initial evaluations
-    X = generate_initial_design(algo_profile, env_profile)
-    
-    mean_at_X = obj_mean(X, function_network, network_to_objective_transform)
-    network_observation_at_X = function_network(X)
-    observation_at_X = network_to_objective_transform(network_observation_at_X)
+    offline_dataset: Optional[OfflineDataset] = None
+    offline_config = env_profile.get("offline_dataset")
+
+    if offline_config is not None:
+        initial_count = algo_profile.get("n_init_evals")
+        if initial_count is None:
+            raise KeyError(
+                "algo_profile must define 'n_init_evals' when using offline datasets"
+            )
+        offline_dataset = load_offline_dataset(
+            data=offline_config,
+            initial_count=initial_count,
+            seed=algo_profile.get("seed"),
+        )
+        (
+            X,
+            network_observation_at_X,
+            observation_at_X,
+            mean_at_X,
+        ) = offline_dataset.get_initial_data()
+    else:
+        # Initial evaluations
+        X = generate_initial_design(algo_profile, env_profile)
+
+        mean_at_X = obj_mean(X, function_network, network_to_objective_transform)
+        network_observation_at_X = function_network(X)
+        observation_at_X = network_to_objective_transform(network_observation_at_X)
     # Current best objective value.
     best_obs_val = observation_at_X.max().item()
 
@@ -76,7 +98,7 @@ def mcbo_trial(
 
         # New suggested point
         t0 = time.time()
-        new_x, new_net = get_new_suggested_point(
+        new_x, new_net, new_point_info = get_new_suggested_point(
             X=X,
             network_observation_at_X=network_observation_at_X,
             observation_at_X=observation_at_X,
@@ -85,28 +107,39 @@ def mcbo_trial(
             function_network=function_network,
             network_to_objective_transform=network_to_objective_transform,
             old_nets=old_nets,
+            candidate_pool=offline_dataset,
         )
         if new_net is not None:
             old_nets.append(new_net)
         t1 = time.time()
         runtimes.append(t1 - t0)
 
-        # Evalaute network at new point
-        network_observation_at_new_x = function_network(new_x)
+        if offline_dataset is None:
+            # Evaluate network at new point
+            network_observation_at_new_x = function_network(new_x)
 
-        # The mean value of the new action. 
-        mean_at_new_x = obj_mean(
-            new_x, function_network, network_to_objective_transform
-        )
-        if mean_at_X is None:
-            mean_at_X = mean_at_new_x
+            # The mean value of the new action.
+            mean_at_new_x = obj_mean(
+                new_x, function_network, network_to_objective_transform
+            )
+            if mean_at_X is None:
+                mean_at_X = mean_at_new_x
+            else:
+                mean_at_X = torch.cat([mean_at_X, mean_at_new_x], 0)
+
+            # Evaluate objective at new point
+            observation_at_new_x = network_to_objective_transform(
+                network_observation_at_new_x
+            )
         else:
+            if new_point_info is None or "candidate_index" not in new_point_info:
+                raise RuntimeError("Candidate index expected when using offline dataset")
+            (
+                network_observation_at_new_x,
+                observation_at_new_x,
+                mean_at_new_x,
+            ) = offline_dataset.pop(new_point_info["candidate_index"])
             mean_at_X = torch.cat([mean_at_X, mean_at_new_x], 0)
-
-        # Evaluate objective at new point
-        observation_at_new_x = network_to_objective_transform(
-            network_observation_at_new_x
-        )
 
         # Update training data
         X = torch.cat([X, new_x], 0)
@@ -237,15 +270,15 @@ def get_acq_fun(
     return acquisition_function, posterior_mean_function
 
 
-def get_new_suggested_point_random(env_profile) -> Tensor:
+def get_new_suggested_point_random(env_profile) -> Tuple[Tensor, None, None]:
     r"""Returns a new suggested point randomly."""
     if env_profile["interventional"]:
         # For interventional random = random targets, random values
         valid_targets_index = range(len(env_profile["valid_targets"]))
         target = env_profile["valid_targets"][np.random.choice(valid_targets_index)]
-        return random_causal(target, env_profile), None
+        return random_causal(target, env_profile), None, None
     else:
-        return torch.rand([1, env_profile["input_dim"]]), None
+        return torch.rand([1, env_profile["input_dim"]]), None, None
 
 
 def get_new_suggested_point(
@@ -257,7 +290,8 @@ def get_new_suggested_point(
     function_network: Callable,
     network_to_objective_transform: Callable,
     old_nets: List,
-) -> Tensor:
+    candidate_pool: Optional[OfflineDataset] = None,
+) -> Tuple[Tensor, Optional[Dict], Optional[Dict[str, int]]]:
 
     algo = algo_profile["algo"]
 
@@ -283,18 +317,32 @@ def get_new_suggested_point(
             algo_profile,
             env_profile,
         )
-        new_x, new_score = optimize_acqf_and_get_suggested_point(
-            acq_func=acquisition_function,
-            bounds=torch.tensor(
-                [
-                    [0.0 for i in range(acq_fun_input_dim)],
-                    [1.0 for i in range(acq_fun_input_dim)],
-                ]
-            ),
-            batch_size=1,
-            posterior_mean=posterior_mean_function,
+        if candidate_pool is None:
+            new_x, _ = optimize_acqf_and_get_suggested_point(
+                acq_func=acquisition_function,
+                bounds=torch.tensor(
+                    [
+                        [0.0 for _ in range(acq_fun_input_dim)],
+                        [1.0 for _ in range(acq_fun_input_dim)],
+                    ]
+                ),
+                batch_size=1,
+                posterior_mean=posterior_mean_function,
+            )
+            return new_x, None, None
+
+        candidate_batch = candidate_pool.get_candidates()
+        if candidate_batch.X.numel() == 0:
+            raise RuntimeError("Candidate pool is empty")
+        acq_inputs = (
+            candidate_batch.X.unsqueeze(-2)
+            if candidate_batch.X.dim() == 2
+            else candidate_batch.X
         )
-        return new_x, None
+        scores = acquisition_function(acq_inputs).view(-1)
+        best_idx = torch.argmax(scores).item()
+        best_x = candidate_batch.X[best_idx : best_idx + 1]
+        return best_x, None, {"candidate_index": int(candidate_batch.indices[best_idx])}
 
     r"""
     The approach is general for both causal BO environments (interventional=True) and 
@@ -306,6 +354,7 @@ def get_new_suggested_point(
     best_x = None
     best_score = -torch.inf
     best_target = None
+    best_candidate_index = None
 
     for target in env_profile["valid_targets"]:
         try:
@@ -314,6 +363,10 @@ def get_new_suggested_point(
             raise ValueError("Model class isn't able to have interventional targets")
         ## Use a different training procedure if noisy MCBO is used.
         if algo == "NMCBO":
+            if candidate_pool is not None:
+                raise NotImplementedError(
+                    "Offline candidate selection is not implemented for NMCBO"
+                )
             new_x, new_score, new_net = eta_network.train(
                 model,
                 network_to_objective_transform,
@@ -330,22 +383,42 @@ def get_new_suggested_point(
                 algo_profile,
                 env_profile,
             )
-
-            new_x, new_score = optimize_acqf_and_get_suggested_point(
-                acq_func=acquisition_function,
-                bounds=torch.tensor(
-                    [
-                        [0.0 for i in range(acq_fun_input_dim)],
-                        [1.0 for i in range(acq_fun_input_dim)],
-                    ]
-                ),
-                batch_size=1,
-                posterior_mean=posterior_mean_function,
-            )
+            if candidate_pool is None:
+                new_x, new_score = optimize_acqf_and_get_suggested_point(
+                    acq_func=acquisition_function,
+                    bounds=torch.tensor(
+                        [
+                            [0.0 for _ in range(acq_fun_input_dim)],
+                            [1.0 for _ in range(acq_fun_input_dim)],
+                        ]
+                    ),
+                    batch_size=1,
+                    posterior_mean=posterior_mean_function,
+                )
+                candidate_index = None
+            else:
+                candidate_batch = candidate_pool.get_candidates(target)
+                if candidate_batch.X.numel() == 0:
+                    continue
+                acq_inputs = (
+                    candidate_batch.X.unsqueeze(-2)
+                    if candidate_batch.X.dim() == 2
+                    else candidate_batch.X
+                )
+                scores = acquisition_function(acq_inputs).view(-1)
+                candidate_index_local = torch.argmax(scores).item()
+                new_x = candidate_batch.X[
+                    candidate_index_local : candidate_index_local + 1
+                ]
+                new_score = scores[candidate_index_local]
+                candidate_index = int(
+                    candidate_batch.indices[candidate_index_local]
+                )
         if new_score > best_score:
             best_score = new_score
             best_x = new_x
             best_target = torch.tensor(target)
+            best_candidate_index = candidate_index if candidate_pool is not None else None
 
     r"""
     For algorithms that hallucinate inputs, we need to remove these parts of the action
@@ -372,4 +445,13 @@ def get_new_suggested_point(
     if algo != "NMCBO":
         new_net = None
 
-    return best_x, new_net
+    if best_x is None:
+        raise RuntimeError("Failed to identify a new candidate point")
+
+    metadata = None
+    if candidate_pool is not None:
+        if best_candidate_index is None:
+            raise RuntimeError("Best candidate index missing for offline dataset")
+        metadata = {"candidate_index": best_candidate_index}
+
+    return best_x, new_net, metadata
