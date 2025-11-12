@@ -187,13 +187,27 @@ class DAG(object):
     Defines a DAG based upon a list of the parents of each node.
     """
 
-    def __init__(self, parent_nodes: List[List[Optional[int]]]):
+    def __init__(
+        self,
+        parent_nodes: List[List[Optional[int]]],
+        objective_nodes: Optional[List[int]] = None,
+    ):
         self.parent_nodes = parent_nodes
         self.n_nodes = len(parent_nodes)
         self.root_nodes = []
+        self._children = [[] for _ in range(self.n_nodes)]
         for k in range(self.n_nodes):
             if len(parent_nodes[k]) == 0:
                 self.root_nodes.append(k)
+            for parent in parent_nodes[k]:
+                if parent is not None:
+                    self._children[parent].append(k)
+
+        if objective_nodes is None:
+            objective_nodes = [
+                node for node, children in enumerate(self._children) if len(children) == 0
+            ]
+        self.objective_nodes = objective_nodes
 
     def get_n_nodes(self):
         return self.n_nodes
@@ -203,6 +217,9 @@ class DAG(object):
 
     def get_root_nodes(self):
         return self.root_nodes
+
+    def get_objective_nodes(self):
+        return self.objective_nodes
 
 
 class FNActionInput(object):

@@ -1,7 +1,6 @@
 import os
 import torch
 import botorch
-from botorch.acquisition.objective import GenericMCObjective
 from botorch.settings import debug
 from torch import Tensor
 import wandb
@@ -101,14 +100,17 @@ def function_network(X: Tensor):
     return env.evaluate(X=X)
 
 
-# Function that maps the network output to the objective value
-network_to_objective_transform = lambda Y, X: Y[..., -1]
-network_to_objective_transform = GenericMCObjective(network_to_objective_transform)
+env_profile = env.get_env_profile()
+
+
+def network_to_objective_transform(Y: Tensor, X: Tensor = None) -> Tensor:
+    return Y[..., env_profile["objective_nodes"]]
+
+
 if noise_scale > 0.001:
     batch_size = wandb.config["batch_size"]
 else:
     batch_size = 2
-env_profile = env.get_env_profile()
 algo_profile = {
     "algo": wandb.config["algo"],
     "seed": wandb.config["seed"],
